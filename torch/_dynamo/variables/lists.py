@@ -2863,7 +2863,16 @@ class ByteArrayVariable(VariableTracker):
     ) -> VariableTracker | None:
         return self._bytearray_constant_method(tx, args, kwargs, "translate")
 
+    def bytearray_reduce(
+        self,
+        tx: "InstructionTranslatorBase",
+        args: list[VariableTracker],
+        kwargs: dict[str, VariableTracker],
+    ) -> VariableTracker | None:
+        return self._bytearray_constant_method(tx, args, kwargs, "__reduce__")
+
     tp_methods = {
+        "__reduce__": Method(bytearray_reduce),
         "index": Method(bytearray_index),
         "rindex": Method(bytearray_rindex),
         "count": Method(bytearray_count),
@@ -3470,6 +3479,25 @@ class ByteArrayIteratorVariable(IteratorVariable):
         value = ConstantVariable.create(data[self.index])
         self.index += 1
         return value
+
+    def reduce(
+        self,
+        tx: "InstructionTranslatorBase",
+        args: list[VariableTracker],
+        kwargs: dict[str, VariableTracker],
+    ) -> VariableTracker:
+        if self.is_exhausted:
+            return VariableTracker.build(tx, (iter, ((),)))
+        # Keep the live parent rather than copying it into the reduction.
+        return TupleVariable(
+            [
+                VariableTracker.build(tx, iter),
+                TupleVariable([self.parent]),
+                ConstantVariable.create(self.index),
+            ]
+        )
+
+    tp_methods = {"__reduce__": Method(reduce)}
 
     def python_type(self) -> type:
         return type(iter(bytearray()))
