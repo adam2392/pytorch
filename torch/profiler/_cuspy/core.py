@@ -7,6 +7,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
+from contextlib import contextmanager, ExitStack
 from typing import Any, cast, NamedTuple, TYPE_CHECKING
 
 import numpy as np
@@ -269,16 +270,17 @@ class _SynchronizedClock:
 
 
 class Cuspy:
-    """Process-wide Cuspy collector / multiplexer singleton. Like PmSampler, ``Cuspy()``
-    returns the one instance (constructed on first call); its settings are snapshotted from
-    the class config -- set via ``cuspy.configure()`` before first use -- not from
-    constructor args."""
+    """Process-wide collector / multiplexer singleton.
+
+    configure() sets collector options until activity collection first starts.
+    Early HES can reserve a subscriber before those options are known; its
+    sharing mode cannot be changed without replacing the subscriber.
+    """
 
     _instance: Cuspy | None = None
     _instance_lock = threading.Lock()
-    # Process-wide settings the singleton snapshots when first constructed; set via
-    # configure() (first-come-first-serve, no env var), defaults otherwise. Both cadences
-    # default to -1 (no background flush / drain -- the caller drives flush()).
+    # Options remain configurable until the first activity collection. Both
+    # cadences default to -1 (caller-driven flush/drain).
     #
     # use_approx_timestamps defaults OFF; when on, the per-subscriber timestamp callback
     # re-times HOST and DEVICE records onto the profiler's approx clock (kineto's timebase).
@@ -295,8 +297,6 @@ class Cuspy:
                 inst = super().__new__(cls)
                 inst._init()
                 cls._instance = inst
-                # the live Cuspy snapshotted the config; lock it
-                cls._configured = True
             return cls._instance
 
     def _init(self) -> None:
@@ -340,6 +340,12 @@ class Cuspy:
         self._cupti = cupti_python.pylibcupti()
         # The CUPTI subscriber handle.
         self._subscriber: int | None = None
+        self._subscriber_allows_multiple: bool | None = None
+        self._config_frozen = False
+        self._setup_in_progress = False
+        self._setup_lock = threading.RLock()
+        self._decoder_running = False
+        self._hes_enabled = False
         self._latency_enabled = False
         self._device_ts_enabled = False
         # Layout state -- a function of registration.
@@ -361,7 +367,7 @@ class Cuspy:
         # Per-(domain, cbid) arm refcount, so consumers wanting the same callback over
         # different windows don't disable each other. Enabled on 0->1, disabled on 1->0.
         self._callback_armed: dict[_CallbackKey, int] = {}
-        self._callback_lock = threading.Lock()
+        self._callback_lock = threading.RLock()
         # Our single CUpti_CallbackFunc trampoline; must outlive the subscription.
         self._callback_trampoline: Any = None
         self._drain_stop = threading.Event()
@@ -424,12 +430,14 @@ class Cuspy:
         self._pm_lock = threading.Lock()
 
     def _ensure_subscribed(self) -> int:
-        """Take the process's one CUPTI subscription if we don't already hold it, and return
-        the handle.
+        with self._callback_lock:
+            return self._subscribe_locked()
 
-        Shared by the activity path (:meth:`register_callbacks`) and the subscriber-callback
-        path, which needs the subscription but none of the user-defined-record machinery --
-        so a callback-only consumer pays for neither UDR mode nor the decode worker.
+    def _subscribe_locked(self) -> int:
+        """Return the shared subscriber while the caller holds _callback_lock.
+
+        Shared by the activity and subscriber-callback paths. Serializing subscription
+        acquisition with release also lets early HES pin one handle through setup.
         """
         if self._subscriber is not None:
             return self._subscriber
@@ -476,15 +484,87 @@ class Cuspy:
                     f"coexisting subscribers: {e}"
                 ) from e
             raise
-        # Arm the per-subscriber approx-clock timestamp callback right after subscribe, before
-        # any user-defined record can be produced. It stays armed for the life of the
-        # subscription (see _release_subscriber_if_idle), not just the activity session.
+        self._subscriber_allows_multiple = not self._timestamp_callback_enabled
         self._timestamp_callback_active = self._try_arm_approx_timestamp_callback(
             self._subscriber
         )
         return self._subscriber
 
+    @contextmanager
+    def _activity_setup(self):
+        """Exclude configuration changes during setup; freeze only on success."""
+        with self._setup_lock:
+            with type(self)._instance_lock, self._lock, self._callback_lock:
+                frozen = self._config_frozen
+                callbacks = self._callbacks_registered
+                timestamp_callback = self._timestamp_callback_active
+                decoder = self._decoder_running
+                drain_thread = self._drain_and_dispatch_thread
+                self._setup_in_progress = True
+            try:
+                yield
+            except Exception:
+                try:
+                    self._rollback_activity_setup(
+                        callbacks, timestamp_callback, decoder, drain_thread
+                    )
+                except Exception as rollback_error:
+                    # A failed rollback can leave native state live: forbid reconfiguration.
+                    frozen = True
+                    raise RuntimeError(
+                        "Cuspy startup rollback failed; native activity state may still be live"
+                    ) from rollback_error
+                raise
+            else:
+                frozen = True
+            finally:
+                with type(self)._instance_lock, self._lock:
+                    self._config_frozen = frozen
+                    if frozen:
+                        type(self)._configured = True
+                    self._setup_in_progress = False
+
+    def _rollback_activity_setup(
+        self,
+        callbacks: bool,
+        timestamp_callback: bool,
+        decoder: bool,
+        drain_thread: Any,
+    ) -> None:
+        self._drain_stop.set()
+        thread = self._drain_and_dispatch_thread
+        if thread is not None and thread is not drain_thread:
+            if thread.ident is not None:
+                thread.join(timeout=5.0)
+                if thread.is_alive():
+                    raise RuntimeError("Cuspy startup drain thread did not stop")
+            self._drain_and_dispatch_thread = drain_thread
+        if self._decoder_running and not decoder:
+            _cuspy_native.stop_decoder()
+            self._decoder_running = False
+        with self._callback_lock:
+            subscriber = self._subscriber
+            if self._callbacks_registered and not callbacks and subscriber is not None:
+                self._cupti.disarm_user_defined_records(subscriber)
+                self._callbacks_registered = False
+            if (
+                self._timestamp_callback_active
+                and not timestamp_callback
+                and subscriber is not None
+            ):
+                if not self._cupti.disarm_approx_timestamp_callback(subscriber):
+                    raise cupti_python.CuptiError(
+                        "CUPTI rejected startup timestamp-callback rollback"
+                    )
+                self._timestamp_callback_active = False
+            self._release_subscriber_if_idle()
+        self._clock.reset()
+
     def register_callbacks(self) -> None:
+        with self._activity_setup():
+            self._register_callbacks()
+
+    def _register_callbacks(self) -> None:
         if self._callbacks_registered:
             return
         native = _cuspy_native
@@ -492,9 +572,16 @@ class Cuspy:
         complete_addr = native.buffer_complete_callback_address()
         # The activity API is subscription-scoped: subscribe, turn on user-defined
         # records, and register the v2 buffer callbacks.
-        subscriber = self._ensure_subscribed()
-        self._cupti.arm_user_defined_records(subscriber, request_addr, complete_addr)
-        self._callbacks_registered = True
+        with self._callback_lock:
+            subscriber = self._ensure_subscribed()
+            if self._timestamp_callback_enabled and not self._timestamp_callback_active:
+                self._timestamp_callback_active = (
+                    self._try_arm_approx_timestamp_callback(subscriber)
+                )
+            self._cupti.arm_user_defined_records(
+                subscriber, request_addr, complete_addr
+            )
+            self._callbacks_registered = True
 
     # --- subscriber callbacks ----------------------------------------------
 
@@ -534,8 +621,8 @@ class Cuspy:
         Exceptions are logged and swallowed.
         """
         handler = _CallbackHandler(domain, cbid, fn)
-        self._ensure_subscribed()
         with self._callback_lock:
+            self._ensure_subscribed()
             key = (domain, cbid)
             self._callback_handlers[key] = self._callback_handlers.get(key, ()) + (fn,)
         return handler
@@ -565,8 +652,8 @@ class Cuspy:
         """Enable one ``(domain, cbid)`` callback, refcounted: CUPTI is told to enable on the
         first arm and to disable on the last :meth:`disarm_callback`, so consumers scoping the
         same callback to different windows don't disable each other."""
-        subscriber = self._ensure_subscribed()
         with self._callback_lock:
+            subscriber = self._ensure_subscribed()
             key = (domain, cbid)
             count = self._callback_armed.get(key, 0)
             self._callback_armed[key] = count + 1
@@ -588,16 +675,23 @@ class Cuspy:
             if self._subscriber is not None:
                 self._cupti.enable_callback(self._subscriber, domain, cbid, False)
 
-    def _release_subscriber_if_idle(self) -> None:
-        """Unsubscribe once neither activity observers nor callback handlers need CUPTI.
+    def _release_subscriber_if_idle(self, *, release_hes: bool = False) -> None:
+        """Release an idle subscription unless early HES must keep it alive.
 
-        The subscription is shared, so it outlives the activity session in both directions:
-        ``stop()`` disarms user-defined records but leaves the handle up while a handler holds
-        it, and a handler registered before any profiling keeps it up for a later ``start()``.
+        Callback handlers share the subscription with activity observers. Early HES
+        also holds it across sessions: a fresh subscriber cannot rearm HES after
+        CUDA driver initialization.
         """
-        if self._observers or self._started:
-            return
         with self._callback_lock:
+            if (
+                self._observers
+                or self._started
+                or self._decoder_running
+                or self._callbacks_registered
+            ):
+                return
+            if self._hes_enabled and not release_hes:
+                return
             subscriber = self._subscriber
             if self._callback_handlers or subscriber is None:
                 return
@@ -610,13 +704,21 @@ class Cuspy:
                 self._timestamp_callback_active = False
             self._cupti.unsubscribe(subscriber)
             self._subscriber = None
+            self._hes_enabled = False
+            self._subscriber_allows_multiple = None
             self._callback_trampoline = None
+            self._latency_enabled = False
 
     def start(self) -> None:
-        if self._started:
-            raise RuntimeError("Cuspy is already started")
+        with self._setup_lock:
+            if self._started:
+                raise RuntimeError("Cuspy is already started")
+            with self._activity_setup():
+                self._start_collection()
+
+    def _start_collection(self) -> None:
         _cuspy_native.configure_buffers(self.buffer_size)
-        self.register_callbacks()
+        self._register_callbacks()
         # Put activity records on kineto's unix timeline via the clock (see _SynchronizedClock):
         # normally cuptiGetTimestamp == CLOCK_REALTIME == unix and records pass through, unless
         # register_callbacks armed the timestamp callback (approx clock). calibrate() reads the
@@ -663,6 +765,7 @@ class Cuspy:
             flush_period_ns,
             flush_fn,
         )
+        self._decoder_running = True
         _cuspy_native.start_decoder()
         # The decode thread self-flushes on background_flush_period_s (configured above); this
         # Python loop only pulls the decoded columns and dispatches them to observers,
@@ -679,6 +782,25 @@ class Cuspy:
         self._started = True
 
     def stop(self) -> None:
+        """Stop collection; release early HES only when no consumers remain.
+
+        Closing the last activity observer retains early HES for later windows.
+        Call stop() explicitly after closing observers and callback handlers, before
+        tearing down CUDA or distributed communication, to release that subscription.
+        Calling it with a live consumer does not schedule a deferred release: call
+        it again after closing that consumer.
+        """
+        with self._setup_lock:
+            self._stop_collection()
+            with self._callback_lock:
+                if self._callbacks_registered and self._subscriber is not None:
+                    self._cupti.disarm_user_defined_records(self._subscriber)
+                    self._callbacks_registered = False
+                self._release_subscriber_if_idle(
+                    release_hes=not self._observers and not self._callback_handlers
+                )
+
+    def _stop_collection(self) -> None:
         if not self._started:
             return
         # Stop the Python drain loop. The decode thread keeps running (and self-flushing
@@ -702,14 +824,14 @@ class Cuspy:
         # the residue.
         self.flush(sync=True)
         _cuspy_native.stop_decoder()
+        self._decoder_running = False
         self._drain_and_dispatch()
         # Disable everything we enabled, then tear down the activity session.
         self._disable(self._enabled.keys())
         self._enabled = {}
-        # Latency timestamps are a property of the subscription we are dropping, so
-        # forget them too -- otherwise the next session sees a stale "already on" and
-        # never arms them for a fresh subscriber.
-        self._latency_enabled = False
+        # Subscription attributes survive while a callback handler or early HES
+        # retains the handle. Keep the latency cache so the next selection can
+        # reconcile it; reset it only when we actually unsubscribe.
         if self._subscriber is not None:
             # Release CUPTI without poisoning it for the next session: turn
             # user-defined-record mode back off (it changes CUPTI's record layout),
@@ -925,6 +1047,10 @@ class Cuspy:
             with self._lock:
                 if obs in self._observers:
                     self._observers.remove(obs)
+                idle = not self._observers
+            if idle:
+                self._stop_collection()
+                self._release_subscriber_if_idle()
             raise
         return obs
 
@@ -937,7 +1063,7 @@ class Cuspy:
             self._observers.remove(obs)
             empty = not self._observers
         if empty:
-            self.stop()
+            self._stop_collection()
         else:
             self._apply_selection()
 
@@ -1460,12 +1586,19 @@ class Cuspy:
         )
 
 
-_hes_enabled = False
-
-
 def enable_hes_early() -> None:
-    global _hes_enabled
-    if _hes_enabled:
+    """Arm HES on a retained subscriber without finalizing collector settings.
+
+    Buffer and cadence settings can be configured after this call, before collection.
+    Approx timestamps require configure(use_approx_timestamps=True) before this call
+    to explicitly request a sole-subscriber handle; HES is non-exclusive by default.
+
+    This reserves CUPTI until release_hes() is called. After the last profiling
+    window, close every activity observer and callback handler, then call
+    release_hes() before shutting down CUDA/NCCL. Window cleanup does not release
+    HES, and interpreter exit is not a substitute for ordered application teardown.
+    """
+    if is_hes_enabled():
         return
     if torch.cuda.is_initialized() or _has_active_cuda_context():
         raise RuntimeError(
@@ -1473,20 +1606,69 @@ def enable_hes_early() -> None:
         )
     from cuda.bindings import driver as cuda_driver  # pyrefly: ignore[missing-import]
 
-    rc = cuda_driver.cuInit(0)[0]
-    if rc != cuda_driver.CUresult.CUDA_SUCCESS:
-        raise RuntimeError(f"cuInit failed with rc={rc}")
+    cuspy = Cuspy()
+    with cuspy._lock, cuspy._callback_lock:
+        if cuspy._hes_enabled:
+            return
+        if cuspy._callbacks_registered:
+            raise RuntimeError(
+                "enable_hes_early() must be called before activity callback registration"
+            )
+        subscriber = cuspy._ensure_subscribed()
+        hes_armed = False
+        try:
+            # UDR will be armed on this same handle when collection starts.
+            cuspy._cupti.activity_enable_hes(subscriber)
+            hes_armed = True
+            rc = cuda_driver.cuInit(0)[0]
+            if rc != cuda_driver.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(f"cuInit failed with rc={rc}")
+        except Exception:
+            try:
+                try:
+                    if hes_armed:
+                        cuspy._cupti.activity_enable_hes(subscriber, enabled=False)
+                finally:
+                    cuspy._release_subscriber_if_idle()
+            except Exception:
+                logger.exception("Failed to roll back Cuspy's early HES subscription")
+            cuspy._callbacks_registered = False
+            raise
+        cuspy._hes_enabled = True
 
-    # Use the direct libcupti call (pylibcupti().activity_enable_hes), not
-    # cupti-python's activity_enable_hw_trace(): after torch is imported, the
-    # latter makes subsequent cuptiActivityRegisterCallbacks() fail with
-    # CUPTI_ERROR_MULTIPLE_SUBSCRIBERS_NOT_SUPPORTED, while the direct call works.
-    cupti_python.pylibcupti().activity_enable_hes()
-    _hes_enabled = True
+
+def release_hes() -> None:
+    """Release the early-HES subscriber before application CUDA/NCCL teardown.
+
+    Pair each enable_hes_early() with this operation after closing every activity
+    observer and callback handler. Raises if collection or another consumer is
+    still live; it never unsubscribes underneath them. Idempotent once released,
+    and a no-op if early HES was never enabled. Does not call cuptiFinalize().
+    HES cannot be re-enabled after CUDA context creation.
+    """
+    with Cuspy._instance_lock:
+        instance = Cuspy._instance
+    if instance is None:
+        return
+    with instance._setup_lock, instance._lock, instance._callback_lock:
+        if not instance._hes_enabled:
+            return
+        if (
+            instance._started
+            or instance._decoder_running
+            or instance._observers
+            or instance._callback_handlers
+        ):
+            raise RuntimeError(
+                "release_hes() requires closing all Cuspy activity observers and "
+                "callback handlers before CUDA/NCCL teardown"
+            )
+        instance.stop()
 
 
 def is_hes_enabled() -> bool:
-    return _hes_enabled
+    instance = Cuspy._instance
+    return instance is not None and instance._hes_enabled
 
 
 def configure(
@@ -1496,27 +1678,74 @@ def configure(
     background_drain_period_s: float | None = None,
     use_approx_timestamps: bool | None = None,
 ) -> None:
-    """Set the process-wide Cuspy settings the singleton snapshots when first
-    constructed (via Cuspy()). First-come-first-serve (like
-    PmSampler.configure): locked once this lands OR the singleton is built, so a later call
-    is ignored with a warning -- pass all settings in one call, before first use. An unset
-    (None) arg keeps its current value. The two cadences default to -1 (caller-driven; a
-    non-negative value opts into background flush/drain at that period)."""
-    with Cuspy._instance_lock:
-        if Cuspy._configured:
-            logger.warning(
-                "cuspy.configure() ignored: already configured "
-                "(first-come-first-serve). Call it once before the first Cuspy()."
-            )
-            return
+    """Set collector options until the first activity collection starts.
+
+    Unset arguments keep their current value. Identical settings remain a no-op
+    after collection starts; changes then raise. A retained multi-subscriber
+    handle cannot enable approx timestamps: configure that option before taking
+    the subscription to explicitly request exclusive CUPTI ownership.
+    """
+    with Cuspy._instance_lock, ExitStack() as locks:
+        instance = Cuspy._instance
+        if instance is not None:
+            locks.enter_context(instance._lock)
+            locks.enter_context(instance._callback_lock)
+        current = (
+            Cuspy._buffer_size,
+            Cuspy._background_flush_period_s,
+            Cuspy._background_drain_period_s,
+            Cuspy._use_approx_timestamps,
+        )
+        requested = (
+            buffer_size,
+            background_flush_period_s,
+            background_drain_period_s,
+            use_approx_timestamps,
+        )
+        values = tuple(
+            old if new is None else new for old, new in zip(current, requested)
+        )
+        if instance is not None:
+            if instance._setup_in_progress:
+                raise RuntimeError(
+                    "Cuspy configuration cannot change during activity setup"
+                )
+            if instance._config_frozen and values != current:
+                raise RuntimeError(
+                    "Cuspy configuration cannot change after activity collection starts"
+                )
+            if values[3] and instance._subscriber_allows_multiple is True:
+                raise RuntimeError(
+                    "use_approx_timestamps=True requires exclusive CUPTI ownership; "
+                    "call configure(use_approx_timestamps=True) before enable_hes_early() "
+                    "or any subscriber registration. The existing shared subscriber "
+                    "will not be replaced."
+                )
+            if instance._timestamp_callback_active and not values[3]:
+                if not instance._cupti.disarm_approx_timestamp_callback(
+                    cast(int, instance._subscriber)
+                ):
+                    raise cupti_python.CuptiError(
+                        "CUPTI rejected TIMESTAMP_CALLBACK removal; "
+                        "approx timestamps and collector configuration remain unchanged"
+                    )
+                instance._timestamp_callback_active = False
         if buffer_size is not None:
             Cuspy._buffer_size = buffer_size
+            if instance is not None:
+                instance.buffer_size = buffer_size
         if background_flush_period_s is not None:
             Cuspy._background_flush_period_s = background_flush_period_s
+            if instance is not None:
+                instance.background_flush_period_s = background_flush_period_s
         if background_drain_period_s is not None:
             Cuspy._background_drain_period_s = background_drain_period_s
+            if instance is not None:
+                instance.background_drain_period_s = background_drain_period_s
         if use_approx_timestamps is not None:
             Cuspy._use_approx_timestamps = use_approx_timestamps
+            if instance is not None:
+                instance._timestamp_callback_enabled = use_approx_timestamps
         Cuspy._configured = True
 
 
@@ -1531,26 +1760,33 @@ def has_live_subscription() -> bool:
 
 
 def get_config() -> dict[str, Any]:
-    """The process-wide config the singleton will snapshot (or snapshotted): buffer_size,
-    the two cadences, the approx-clock flag, and whether configure()/construction has pinned
-    it (first-come-first-serve)."""
-    return {
-        "buffer_size": Cuspy._buffer_size,
-        "background_flush_period_s": Cuspy._background_flush_period_s,
-        "background_drain_period_s": Cuspy._background_drain_period_s,
-        "use_approx_timestamps": Cuspy._use_approx_timestamps,
-        "configured": Cuspy._configured,
-        # Capability flag, not a setting: lets a consumer detect the shared
-        # subscriber-callback registry (Cuspy.register_callback_handler) and stop
-        # taking a CUPTI subscription of its own, without hasattr-probing.
-        "supports_callback_handlers": True,
-    }
+    """Current collector options and whether configuration or collection has occurred.
+
+    Constructing the singleton or enabling early HES alone does not finalize options.
+    """
+    with Cuspy._instance_lock:
+        return {
+            "buffer_size": Cuspy._buffer_size,
+            "background_flush_period_s": Cuspy._background_flush_period_s,
+            "background_drain_period_s": Cuspy._background_drain_period_s,
+            "use_approx_timestamps": Cuspy._use_approx_timestamps,
+            "configured": Cuspy._configured,
+            # Capability flag, not a setting: lets a consumer detect the shared
+            # subscriber-callback registry and avoid a separate subscription.
+            "supports_callback_handlers": True,
+        }
 
 
 def _reset_for_test() -> None:
     """Test-only: drop the singleton and reset the config to defaults so a test can build a
     freshly-configured Cuspy. Callers must have torn down any live session first."""
     with Cuspy._instance_lock:
+        instance = Cuspy._instance
+        if instance is not None and instance._hes_enabled:
+            if instance._callbacks_registered and instance._subscriber is not None:
+                instance._cupti.disarm_user_defined_records(instance._subscriber)
+                instance._callbacks_registered = False
+            instance._release_subscriber_if_idle(release_hes=True)
         Cuspy._instance = None
         Cuspy._buffer_size = 4 * 1024 * 1024
         Cuspy._background_flush_period_s = -1.0
