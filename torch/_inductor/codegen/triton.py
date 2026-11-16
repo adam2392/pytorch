@@ -8353,8 +8353,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 ),
                 "constants": {},
                 "native_matmul": (
-                    torch._inductor.config.triton.native_matmul
-                    and ("tl.dot" in str(self.body) or "tl.dot" in str(self.compute))
+                    "tl.dot" in str(self.body) or "tl.dot" in str(self.compute)
                 ),
                 **self.triton_meta_common(),
             },
