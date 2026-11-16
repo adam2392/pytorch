@@ -177,12 +177,6 @@ class TestFakeTensor(_TestFakeTensorHelpers, TestCase):
         self.assertFalse(mode.allow_fallback_kernels)
 
     def test_mode_constructor_export(self):
-        if torch._dynamo.config.use_cpp_fake_tensor:
-            with self.assertRaisesRegex(
-                NotImplementedError, "export=True"
-            ):
-                FakeTensorMode(export=True)
-            return
         mode = FakeTensorMode(export=True)
         self.assertTrue(mode.fake_tensor_converter.export)
 
