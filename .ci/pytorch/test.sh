@@ -2681,6 +2681,8 @@ elif [[ "${TEST_CONFIG}" == *operator_microbenchmark* ]]; then
   test_operator_microbenchmark
 elif [[ "${TEST_CONFIG}" == *attention_microbenchmark* ]]; then
   test_attention_microbenchmark
+elif [[ "${TEST_CONFIG}" == "inductor_benchmark_runner" ]]; then
+  python test/run_test.py --include dynamo/test_benchmark_runner --verbose
 elif [[ "${TEST_CONFIG}" == *inductor_distributed* ]]; then
   setup_torch_trace
   test_inductor_distributed
