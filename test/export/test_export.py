@@ -15751,6 +15751,39 @@ def forward(self, x, b_t, y):
             gm.code,
         )
 
+    def test_export_autocast_casts_inputs(self):
+        class Model(torch.nn.Module):
+            def forward(self, q, k, v):
+                with torch.autocast("cpu", dtype=torch.bfloat16):
+                    return F.scaled_dot_product_attention(q, k, v)
+
+        # Only autocast makes the dtypes of q, k and v match.
+        q = torch.randn(1, 4, 8, 16)
+        k = torch.randn(1, 4, 8, 16)
+        v = torch.randn(1, 4, 8, 16, dtype=torch.bfloat16)
+        self._test_export_same_as_eager(Model(), (q, k, v))
+
+    def test_export_nested_autocast_dtypes(self):
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(4, 4)
+
+            def forward(self, x):
+                with torch.autocast("cpu", dtype=torch.bfloat16):
+                    a = self.linear(x)
+                    with torch.autocast("cpu", enabled=False):
+                        b = self.linear(x)
+                    c = self.linear(x)
+                d = self.linear(x)
+                return a, b, c, d
+
+        ep = export(Model(), (torch.randn(2, 4),))
+        self.assertEqual(
+            [out.meta["val"].dtype for out in ep.graph.output_node().args[0]],
+            [torch.bfloat16, torch.float32, torch.bfloat16, torch.float32],
+        )
+
     def test_export_as_backend(self):
         def f(x, y):
             return x + y

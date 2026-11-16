@@ -236,6 +236,54 @@ def forward(self, a_1):
         out2.sum().backward()
         self.assertEqual(a1.grad, a2.grad)
 
+    def test_pre_dispatch_autocast_restored_after_error(self):
+        # Strict export traces _enter_autocast from a Dynamo graph, which has no
+        # finally block to exit it when the traced code raises.
+        def raise_in_open_autocast():
+            torch.amp.autocast_mode._enter_autocast("cpu", torch.bfloat16, True, None)
+            raise RuntimeError("error inside autocast")
+
+        def alone(x):
+            raise_in_open_autocast()
+
+        def inside_with(x):
+            with torch.autocast("cpu", dtype=torch.float16):
+                raise_in_open_autocast()
+
+        def autocast_state():
+            nesting = torch.autocast_increment_nesting()
+            torch.autocast_decrement_nesting()
+            return (
+                torch.is_autocast_enabled("cpu"),
+                torch.get_autocast_dtype("cpu"),
+                torch.is_autocast_cache_enabled(),
+                nesting,
+            )
+
+        for f in (alone, inside_with):
+            with self.subTest(f.__name__):
+                before = autocast_state()
+                with self.assertRaisesRegex(RuntimeError, "error inside autocast"):
+                    make_fx(f, pre_dispatch=True, tracing_mode=self.tracing_mode)(
+                        torch.randn(2)
+                    )
+                self.assertEqual(autocast_state(), before)
+
+    def test_pre_dispatch_autocast_across_cond(self):
+        def f(x, w):
+            ctx = torch.amp.autocast_mode._enter_autocast("cpu", torch.bfloat16, True, None)
+            y = torch.cond(x.sum() > 0, lambda x: x.mm(x), lambda x: x.mm(x).neg(), (x,))
+            out = torch.mm(y.float(), w)
+            torch.amp.autocast_mode._exit_autocast(ctx)
+            return out
+
+        gm = make_fx(f, pre_dispatch=True, tracing_mode=self.tracing_mode)(
+            torch.randn(2, 2), torch.randn(2, 2)
+        )
+        for graph in (gm.true_graph_0.graph, gm.false_graph_0.graph, gm.graph):
+            (mm,) = graph.find_nodes(op="call_function", target=torch.ops.aten.mm.default)
+            self.assertEqual(mm.meta["val"].dtype, torch.bfloat16)
+
     def test_make_fx_simple(self):
         def f(x):
             return torch.sin(x)
