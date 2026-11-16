@@ -174,12 +174,6 @@ class TestFakeTensor(_TestFakeTensorHelpers, TestCase):
         self.assertTrue(mode.is_our_fake(fake))
 
     def test_mode_constructor_disallow_fallback_kernels(self):
-        if torch._dynamo.config.use_cpp_fake_tensor:
-            with self.assertRaisesRegex(
-                NotImplementedError, "allow_fallback_kernels=False"
-            ):
-                FakeTensorMode(allow_fallback_kernels=False)
-            return
         mode = FakeTensorMode(allow_fallback_kernels=False)
         self.assertFalse(mode.allow_fallback_kernels)
 
@@ -559,11 +553,9 @@ class TestFakeTensor(_TestFakeTensorHelpers, TestCase):
                 return self.cos()
 
             x = torch.empty(2, 2, device="cpu")
-            exc, msg = expectedIfCppFakeTensor(
-                (RuntimeError, "my_test_op::foo"),
-                (UnsupportedOperatorException, "my_test_op.foo.default"),
-            )
-            with self.assertRaisesRegex(exc, msg):
+            with self.assertRaisesRegex(
+                UnsupportedOperatorException, "my_test_op.foo.default"
+            ):
                 with FakeTensorMode(allow_fallback_kernels=True) as mode:
                     x = mode.from_tensor(x)
                     torch.ops.my_test_op.foo(x)
